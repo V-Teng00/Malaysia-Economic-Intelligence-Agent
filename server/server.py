@@ -1,3 +1,8 @@
+"""
+Malaysia Economic Data MCP Server.
+Custom tools over public Malaysian economic data (data.gov.my, api.bnm.gov.my)
+"""
+
 import os
 from datetime import datetime
 from typing import Optional
@@ -8,13 +13,14 @@ from mcp.server.mcpserver import MCPServer
 mcp = MCPServer("malaysia-econ-data", version="0.1.0")
 
 BASE_URL = "https://api.data.gov.my/data-catalogue"
-EXCHANGE_RATES_DATASET_MIN_DATE = "2003-01-01"  # per dataset docs
+EXCHANGE_RATES_DATASET_MIN_DATE = "2003-01-01"
 
 BNM_BASE_URL = "https://api.bnm.gov.my/public"
-BNM_HEADERS = {"Accept": "application/vnd.BNM.API.v1+json"}  # required — confirmed 2026-09-12
+BNM_HEADERS = {"Accept": "application/vnd.BNM.API.v1+json"}  # required by BNM's API
 
 
 async def _fetch_dataset(dataset_id: str, extra_params: Optional[dict] = None) -> list[dict]:
+    """Query data.gov.my with server-side filters (see developer.data.gov.my/request-query)."""
     params = {"id": dataset_id, **(extra_params or {})}
     async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
         resp = await client.get(BASE_URL, params=params)
@@ -37,24 +43,23 @@ async def get_myr_exchange_rate(
     indicator: str = "avg",
 ) -> dict:
     """
+    Get MYR exchange rate history against a currency (data.gov.my,
+    monthly frequency, CC BY 4.0). Covers 2003-01-01 onward.
+
     Args:
-        currency_code: 3-letter ISO currency code (e.g. 'USD', 'SGD', 'EUR').
-        start_date: Optional 'YYYY-MM-DD'. If before 2003-01-01, this tool
-            returns an explicit out_of_range flag rather than fabricating data.
+        currency_code: 3-letter code, e.g. 'USD', 'SGD', 'EUR'.
+        start_date: Optional 'YYYY-MM-DD'.
         end_date: Optional 'YYYY-MM-DD'.
-        indicator: One of 'high', 'low', 'avg', 'start', 'end'. Defaults to
-            'avg'. Do NOT mix indicators across a single comparison without
-            saying so — they are not interchangeable.
+        indicator: One of 'high', 'low', 'avg', 'start', 'end'. These are
+            NOT interchangeable — don't mix indicators in one comparison.
 
     Returns:
-        dict with: currency_code, indicator, records (list of {date, rate}),
-        pct_change_over_period (float or None), out_of_range (bool),
-        data_source (string, for citation).
+        dict: currency_code, indicator, records ([{date, rate}]),
+        pct_change_over_period, out_of_range (True if start_date predates
+        2003-01-01), data_source.
     """
-    currency_code = currency_code.lower()  # data.gov.my returns lowercase currency keys
-    out_of_range = False
-    if start_date and start_date < EXCHANGE_RATES_DATASET_MIN_DATE:
-        out_of_range = True
+    currency_code = currency_code.lower()
+    out_of_range = bool(start_date and start_date < EXCHANGE_RATES_DATASET_MIN_DATE)
 
     params = {"ifilter": f"{indicator}@indicator", "sort": "date", "limit": 5000}
     if start_date:
@@ -67,9 +72,7 @@ async def get_myr_exchange_rate(
 
     pct_change = None
     if len(records) >= 2 and records[0]["rate"]:
-        pct_change = round(
-            (records[-1]["rate"] - records[0]["rate"]) / records[0]["rate"] * 100, 3
-        )
+        pct_change = round((records[-1]["rate"] - records[0]["rate"]) / records[0]["rate"] * 100, 3)
 
     return {
         "currency_code": currency_code,
@@ -89,18 +92,19 @@ async def get_interest_rate_history(
     end_date: Optional[str] = None,
 ) -> dict:
     """
+    Get Malaysian interest rate history (data.gov.my, CC BY 4.0). Covers
+    fixed-deposit rates and BLR/ALR/SR — NOT OPR (use get_opr_history).
+
     Args:
-        rate_type: exact value of the 'rate' field, e.g. 'fdr_1mo'.
-        bank: optional filter on the 'bank' field (e.g. 'commercial').
-            None returns all banks.
+        rate_type: exact 'rate' label, e.g. 'fdr_1mo', 'blr'. If unsure,
+            check `available_rate_types` in the response.
+        bank: optional, e.g. 'commercial' or 'investment'. None = all banks.
         start_date: optional 'YYYY-MM-DD'.
         end_date: optional 'YYYY-MM-DD'.
 
     Returns:
-        dict with: rate_type, bank_filter, records (list of
-        {date, bank, value}), available_rate_types (distinct 'rate'
-        labels seen in this fetch — use this to self-correct a wrong
-        rate_type instead of guessing again), found, data_source.
+        dict: rate_type, bank_filter, records ([{date, bank, value}]),
+        available_rate_types, found, data_source.
     """
     probe = await _fetch_dataset("interestrates", {"sort": "date", "limit": 2000})
     available_rate_types = sorted({row["rate"] for row in probe if "rate" in row})
@@ -133,17 +137,19 @@ async def get_opr_history(
     end_date: Optional[str] = None,
 ) -> dict:
     """
+    Get Bank Negara Malaysia's Overnight Policy Rate (OPR) history
+    (api.bnm.gov.my, official public API). OPR only changes at Monetary
+    Policy Committee meetings — a gap between records means no change
+    happened, not missing data.
+
     Args:
-        start_date: Optional 'YYYY-MM-DD'. If both start_date and
-            end_date are omitted, returns only the single latest OPR
-            decision (not a history).
+        start_date: Optional 'YYYY-MM-DD'. If both dates are omitted,
+            returns only the single latest decision, not a history.
         end_date: Optional 'YYYY-MM-DD'.
 
     Returns:
-        dict with: records (list of {date, new_opr_level, change_in_opr},
-        sorted oldest to newest), is_latest_only (bool — true means the
-        caller asked for no range and got just the single latest value),
-        data_source.
+        dict: records ([{date, new_opr_level, change_in_opr}]),
+        is_latest_only, data_source.
     """
     if start_date is None and end_date is None:
         payload = await _fetch_bnm("opr")
