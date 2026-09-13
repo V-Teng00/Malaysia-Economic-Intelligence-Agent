@@ -4,9 +4,7 @@ Malaysia Economic Intelligence Agent — orchestrator.
 Connects to the MCP server (server/server.py) as a client, exposes its
 tools to Claude, runs an agentic tool-call loop, then runs a SEPARATE
 reflection pass that checks the draft answer against the actual tool
-results before returning a final answer. The reflection step is a real
-second model call, not the same turn continuing — see eval/questions.md
-for what it's checked against.
+results before returning a final answer. 
 
 Requires:
   - The MCP server running separately (`python ../server/server.py`).
@@ -26,15 +24,29 @@ from anthropic import Anthropic
 from dotenv import load_dotenv
 from mcp import Client
 
-load_dotenv()
+load_dotenv()  # reads agent/.env if present; real environment variables still take precedence
 
 MCP_SERVER_URL = os.environ.get("MCP_SERVER_URL", "http://localhost:8000/mcp")
 MODEL = "claude-sonnet-5"
 MAX_TOOL_ITERATIONS = 6
 
+WEB_SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search", "max_uses": 3}
+
 PLANNER_SYSTEM_PROMPT = """You are an assistant answering questions about \
 Malaysian economic data (exchange rates, interest rates, the Overnight \
 Policy Rate) using the tools provided.
+
+You have two categories of tool:
+1. Structured data tools (get_myr_exchange_rate, get_interest_rate_history, \
+get_opr_history) — use these for any question about specific historical \
+figures, trends, or "what is the current rate" questions. These are the \
+ONLY source for numeric claims.
+2. web_search — use this ONLY for qualitative context the structured \
+tools cannot provide (e.g. "why did BNM cut rates", recent policy \
+commentary, news about upcoming decisions). NEVER use web_search to find \
+or substitute a numeric rate/exchange figure that the structured tools \
+are meant to provide — if a structured tool doesn't have it, say so \
+explicitly rather than searching for a number to fill the gap.
 
 Rules:
 - Every factual claim must trace to a tool result. Never state a figure \
@@ -48,6 +60,8 @@ for OPR questions.
 single exchange-rate comparison without saying so.
 - A gap between OPR records is normal (rate unchanged at that meeting), \
 not missing data.
+- When citing a web search result, note it's from a web source (not the \
+structured government data) so the two are never confused in the answer.
 """
 
 REFLECTION_SYSTEM_PROMPT = """You are reviewing a draft answer for \
@@ -99,28 +113,71 @@ async def run_agent_loop(question: str, mcp_client: Client, anthropic_client: An
             messages=messages,
             tools=tools,
         )
+
+        if os.environ.get("AGENT_DEBUG"):
+            web_search_count = 0
+            if response.usage and getattr(response.usage, "server_tool_use", None):
+                web_search_count = getattr(response.usage.server_tool_use, "web_search_requests", 0)
+            print(f"[DEBUG] web_search_requests = {web_search_count}", file=sys.stderr)
+
         messages.append(response.to_param())
 
         if response.stop_reason != "tool_use":
             draft = "".join(block.text for block in response.content if block.type == "text")
+
+            citations = []
+            for block in response.content:
+                if block.type == "text" and getattr(block, "citations", None):
+                    for c in block.citations:
+                        try:
+                            citations.append(c.model_dump())
+                        except Exception:
+                            citations.append(str(c))
+            if citations:
+                tool_call_log.append({"tool": "web_search_citations", "args": {}, "result": citations})
             return draft, tool_call_log
 
         tool_results_content = []
         for block in response.content:
-            if block.type != "tool_use":
-                continue
-            result = await mcp_client.call_tool(block.name, block.input)
-            if result.structured_content is not None:
-                result_data = result.structured_content
-            else:
-                text_parts = [b.text for b in result.content if getattr(b, "type", None) == "text"]
-                result_data = "\n".join(text_parts)
-            tool_call_log.append({"tool": block.name, "args": block.input, "result": result_data})
-            tool_results_content.append({
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "content": json.dumps(result_data, default=str),
-            })
+            if block.type == "tool_use":
+                result = await mcp_client.call_tool(block.name, block.input)
+                if result.structured_content is not None:
+                    result_data = result.structured_content
+                else:
+                    text_parts = [b.text for b in result.content if getattr(b, "type", None) == "text"]
+                    result_data = "\n".join(text_parts)
+                tool_call_log.append({"tool": block.name, "args": block.input, "result": result_data})
+                tool_results_content.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": json.dumps(result_data, default=str),
+                })
+            elif "web_search" in getattr(block, "type", "") or "server_tool" in getattr(block, "type", ""):
+                try:
+                    logged = block.model_dump()
+                except Exception:
+                    logged = str(block)
+                tool_call_log.append({"tool": f"web_search ({block.type})", "args": {}, "result": logged})
+            elif block.type != "text":
+                try:
+                    logged = block.model_dump()
+                except Exception:
+                    logged = str(block)
+                tool_call_log.append({"tool": f"unhandled block ({block.type})", "args": {}, "result": logged})
+        if not tool_results_content:
+            draft = "".join(block.text for block in response.content if block.type == "text")
+            if draft:
+                citations = []
+                for block in response.content:
+                    if block.type == "text" and getattr(block, "citations", None):
+                        for c in block.citations:
+                            try:
+                                citations.append(c.model_dump())
+                            except Exception:
+                                citations.append(str(c))
+                if citations:
+                    tool_call_log.append({"tool": "web_search_citations", "args": {}, "result": citations})
+                return draft, tool_call_log
         messages.append({"role": "user", "content": tool_results_content})
 
     return "[Stopped: exceeded max tool iterations without a final answer]", tool_call_log
@@ -185,7 +242,7 @@ async def main(question: str):
 
     async with Client(MCP_SERVER_URL) as mcp_client:
         tools_result = await mcp_client.list_tools()
-        tools = mcp_tools_to_anthropic_format(tools_result.tools)
+        tools = mcp_tools_to_anthropic_format(tools_result.tools) + [WEB_SEARCH_TOOL]
 
         draft_answer, tool_call_log = await run_agent_loop(question, mcp_client, anthropic_client, tools)
 
