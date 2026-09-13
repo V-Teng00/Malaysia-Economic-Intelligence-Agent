@@ -6,13 +6,14 @@ Custom tools over public Malaysian economic data (data.gov.my, api.bnm.gov.my)
 import os
 from datetime import datetime
 from typing import Optional
+import asyncio
 
 import httpx
 from mcp.server.mcpserver import MCPServer
 
 mcp = MCPServer("malaysia-econ-data", version="0.1.0")
 
-BASE_URL = "https://api.data.gov.my/data-catalogue"
+BASE_URL = "https://api.data.gov.my/data-catalogue/"
 EXCHANGE_RATES_DATASET_MIN_DATE = "2003-01-01"
 
 BNM_BASE_URL = "https://api.bnm.gov.my/public"
@@ -24,6 +25,11 @@ async def _fetch_dataset(dataset_id: str, extra_params: Optional[dict] = None) -
     params = {"id": dataset_id, **(extra_params or {})}
     async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
         resp = await client.get(BASE_URL, params=params)
+        if resp.status_code == 429:
+            await asyncio.sleep(2)
+            resp = await client.get(BASE_URL, params=params)
+        if resp.status_code == 404:
+            return []
         resp.raise_for_status()
         return resp.json()
 
@@ -104,22 +110,25 @@ async def get_interest_rate_history(
 
     Returns:
         dict: rate_type, bank_filter, records ([{date, bank, value}]),
-        available_rate_types, found, data_source.
+        available_rate_types (only populated when found=false, to help
+        self-correct a wrong rate_type without an extra call otherwise),
+        found, data_source.
     """
-    probe = await _fetch_dataset("interestrates", {"sort": "date", "limit": 2000})
-    available_rate_types = sorted({row["rate"] for row in probe if "rate" in row})
-
-    filter_parts = [f"{rate_type}@rate"]
-    if bank:
-        filter_parts.append(f"{bank}@bank")
-    params = {"ifilter": ",".join(filter_parts), "sort": "date", "limit": 5000}
+    params = {"ifilter": f"{rate_type}@rate", "sort": "date", "limit": 5000}
     if start_date:
         params["date_start"] = f"{start_date}@date"
     if end_date:
         params["date_end"] = f"{end_date}@date"
 
     raw = await _fetch_dataset("interestrates", params)
+    if bank:
+        raw = [r for r in raw if r.get("bank") == bank]
     records = [{"date": r["date"], "bank": r.get("bank"), "value": r["value"]} for r in raw]
+
+    available_rate_types = []
+    if not records:
+        probe = await _fetch_dataset("interestrates", {"sort": "date", "limit": 2000})
+        available_rate_types = sorted({row["rate"] for row in probe if "rate" in row})
 
     return {
         "rate_type": rate_type,
@@ -183,6 +192,14 @@ async def get_opr_history(
         and (end_date is None or r["date"] <= end_date)
     ]
     filtered.sort(key=lambda r: r["date"])
+
+    seen_dates = set()
+    deduped = []
+    for r in filtered:
+        if r["date"] not in seen_dates:
+            seen_dates.add(r["date"])
+            deduped.append(r)
+    filtered = deduped
 
     return {
         "records": [{
