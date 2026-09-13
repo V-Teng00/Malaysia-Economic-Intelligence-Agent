@@ -4,7 +4,7 @@ Malaysia Economic Intelligence Agent — orchestrator.
 Connects to the MCP server (server/server.py) as a client, exposes its
 tools to Claude, runs an agentic tool-call loop, then runs a SEPARATE
 reflection pass that checks the draft answer against the actual tool
-results before returning a final answer. 
+results before returning a final answer.
 
 Requires:
   - The MCP server running separately (`python ../server/server.py`).
@@ -24,7 +24,7 @@ from anthropic import Anthropic
 from dotenv import load_dotenv
 from mcp import Client
 
-load_dotenv()  # reads agent/.env if present; real environment variables still take precedence
+load_dotenv()
 
 MCP_SERVER_URL = os.environ.get("MCP_SERVER_URL", "http://localhost:8000/mcp")
 MODEL = "claude-sonnet-5"
@@ -77,6 +77,12 @@ treated as comparable, or OPR conflated with fixed-deposit/BLR rates).
 the draft did not clearly flag that to the user.
 4. Any numeric error (wrong sign, wrong percentage direction, etc.) \
 versus what the tool log actually shows.
+5. A claim near a web search citation that goes beyond what the cited \
+text (up to 150 chars) actually shows — note it as PARTIALLY sourced, \
+not fully verified, rather than silently treating proximity to a \
+citation as proof.
+6. A source-type misattribution — e.g. citing a news article's coverage \
+of a document as if it were a direct quote from that document itself.
 
 Respond with ONLY a JSON object, no other text, no markdown fences:
 {"grounded": true|false, "flags": ["short description", ...], "final_answer": "..."}
@@ -86,6 +92,28 @@ equal to the draft (verbatim). If not, set grounded=false, list the \
 flags, and write a corrected final_answer that fixes them — including \
 adding an explicit "data not available" statement if the draft \
 incorrectly implied an answer existed.
+"""
+
+CLAIMS_TRACE_SYSTEM_PROMPT = """You are given a FINAL, already-corrected \
+answer and the tool call log it was checked against. Your only job is to \
+break the answer into a per-claim source trace — you are not checking \
+correctness (that already happened) and not rewriting the answer.
+
+Respond with ONLY a JSON object, no other text, no markdown fences:
+{
+  "claims": [
+    {"claim": "short paraphrase of one factual assertion in the answer",
+     "source": "tool_data" | "web_citation" | "unverified",
+     "detail": "e.g. 'get_opr_history record dated 2025-07-09', the cited URL, or 'no tracing source found' for unverified"}
+  ]
+}
+
+One entry per distinct factual assertion (a date, a rate, a stated \
+reason) — not one entry for the whole answer, and not an entry for pure \
+framing/transition prose. If a claim extends beyond what its citation's \
+cited_text (max 150 chars) actually shows, mark it "unverified" with a \
+detail explaining the citation only partially covers it, even if a \
+citation exists nearby.
 """
 
 
@@ -216,6 +244,39 @@ def run_reflection(question: str, draft_answer: str, tool_call_log: list[dict], 
         }
 
 
+def run_claims_trace(question: str, final_answer: str, tool_call_log: list[dict], anthropic_client: Anthropic) -> list[dict]:
+    """
+    SEPARATE call from run_reflection, deliberately. Phase 5 v1 combined
+    correctness-checking + claims breakdown in one call — a heavily-cited
+    web-search answer needed both a full corrected answer AND a long
+    claims list in the same response, and hit the token ceiling, silently
+    discarding a genuinely correct fix (confirmed in testing: reflection
+    caught a real source misattribution, then the response got truncated
+    into invalid JSON, and the corrected answer was lost). Splitting the
+    two concerns means a size problem in one doesn't sacrifice the other.
+    Returns [] on any failure — a missing claims trace is a lesser failure
+    than losing a correctness fix, so this never overwrites final_answer.
+    """
+    trace_input = {"question": question, "final_answer": final_answer, "tool_call_log": tool_call_log}
+    try:
+        response = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=4096,
+            system=CLAIMS_TRACE_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": json.dumps(trace_input, default=str)}],
+        )
+        raw_text = "".join(block.text for block in response.content if block.type == "text")
+        cleaned = raw_text.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.strip("`")
+            if cleaned.startswith("json"):
+                cleaned = cleaned[4:]
+            cleaned = cleaned.strip()
+        return json.loads(cleaned).get("claims", [])
+    except Exception:
+        return []
+
+
 def summarize_for_display(result_data, head: int = 3, tail: int = 10):
     """
     For our own audit printing only — NOT used for what's sent to the
@@ -247,6 +308,8 @@ async def main(question: str):
         draft_answer, tool_call_log = await run_agent_loop(question, mcp_client, anthropic_client, tools)
 
     verdict = run_reflection(question, draft_answer, tool_call_log, anthropic_client)
+    final_answer = verdict.get("final_answer", draft_answer)
+    claims = run_claims_trace(question, final_answer, tool_call_log, anthropic_client)
 
     print("\n=== TOOL CALLS (with results) ===")
     for call in tool_call_log:
@@ -264,7 +327,24 @@ async def main(question: str):
         print(verdict["_raw_reflection_output"])
 
     print("\n=== FINAL ANSWER ===")
-    print(verdict.get("final_answer", draft_answer))
+    print(final_answer)
+
+    if claims:
+        print("\n=== SOURCE TRACE (per-claim) ===")
+        source_counts = {}
+        for c in claims:
+            src = c.get("source", "unverified")
+            source_counts[src] = source_counts.get(src, 0) + 1
+            marker = {"tool_data": "✅", "web_citation": "🔗", "unverified": "⚠️"}.get(src, "?")
+            print(f"{marker} [{src}] {c.get('claim', '')}")
+            if c.get("detail"):
+                print(f"    → {c['detail']}")
+        print(f"\nSummary: {source_counts}")
+        if source_counts.get("unverified"):
+            print("NOTE: unverified claims above were kept in the final answer anyway "
+                  "if reflection judged them as reasonable framing rather than a "
+                  "factual assertion needing a source — review them yourself, don't "
+                  "assume 'unverified' always means 'wrong'.")
 
 
 if __name__ == "__main__":
